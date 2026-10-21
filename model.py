@@ -1,51 +1,82 @@
-# # from langchain_google_genai import ChatGoogleGenerativeAI
-from openai import AsyncOpenAI
-from dotenv import load_dotenv
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
+from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 import os
+
+from dotenv import load_dotenv
+from openai import AsyncOpenAI
 
 load_dotenv()
 
 
-base_url = os.getenv("FREELLMAPI_BASE_URL")
-model_name = os.getenv("FREELLMAPI_MODEL")
-API_KEY = os.getenv("FREELLMAPI_API_KEY")
-
-print("BASE URL:", base_url)
-print("MODEL:", model_name)
-print("API KEY EXISTS:", bool(API_KEY))
-
-client = AsyncOpenAI(base_url=base_url, api_key=API_KEY)
+@dataclass(frozen=True)
+class ModelSettings:
+    base_url: str
+    model: str
+    api_key: str = field(repr=False)
 
 
-async def llm(prompt):
+_active_model: ContextVar[tuple[AsyncOpenAI, str] | None] = ContextVar(
+    "active_model", default=None
+)
+
+
+def validate_settings(settings: ModelSettings) -> None:
+    if not settings.base_url.strip():
+        raise ValueError("Enter an API base URL.")
+    if not settings.model.strip():
+        raise ValueError("Enter a model name.")
+    if not settings.api_key.strip():
+        raise ValueError("Enter an API key.")
+
+
+async def _complete(client: AsyncOpenAI, model: str, prompt: str) -> str:
     response = await client.chat.completions.create(
-        model=model_name, messages=[{"role": "user", "content": prompt}]
+        model=model, messages=[{"role": "user", "content": prompt}]
     )
-    print(response.choices[0].message.content)
-    return response.choices[0].message.content
+    content = response.choices[0].message.content
+    if content is None:
+        raise ValueError("The model returned an empty response.")
+    return content
 
 
-# import asyncio
-# from openai import AsyncOpenAI
-
-# client = AsyncOpenAI(base_url="http://127.0.0.1:31415/v1", api_key=API_KEY)
-
-
-# async def test():
-
-#     response = await client.chat.completions.create(
-#         model="glm-4.5-flash", messages=[{"role": "user", "content": "Hello"}]
-#     )
-
-#     print(response.choices[0].message.content)
+@asynccontextmanager
+async def model_session(settings: ModelSettings) -> AsyncIterator[None]:
+    validate_settings(settings)
+    async with AsyncOpenAI(
+        base_url=settings.base_url, api_key=settings.api_key
+    ) as client:
+        token = _active_model.set((client, settings.model))
+        try:
+            yield
+        finally:
+            _active_model.reset(token)
 
 
-# asyncio.run(test())
+async def test_api_connection(settings: ModelSettings) -> str:
+    validate_settings(settings)
+    async with AsyncOpenAI(
+        base_url=settings.base_url, api_key=settings.api_key
+    ) as client:
+        return await _complete(
+            client, settings.model, "Reply with only the word OK."
+        )
 
 
-# async def llm(prompt):
-#     llm = ChatGoogleGenerativeAI(
-#         model=os.getenv("GEMINI_API_MODEL_FLASH"),
-#     )
-#     response = await llm.ainvoke(prompt)
-#     return response.content
+async def llm(prompt: str) -> str:
+    active_model = _active_model.get()
+    if active_model is not None:
+        client, model = active_model
+        return await _complete(client, model, prompt)
+
+    settings = ModelSettings(
+        base_url=os.getenv("FREELLMAPI_BASE_URL", ""),
+        model=os.getenv("FREELLMAPI_MODEL", ""),
+        api_key=os.getenv("FREELLMAPI_API_KEY", ""),
+    )
+    validate_settings(settings)
+    async with AsyncOpenAI(
+        base_url=settings.base_url, api_key=settings.api_key
+    ) as client:
+        return await _complete(client, settings.model, prompt)
